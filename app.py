@@ -11,8 +11,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# ---------------------- 模块1：n元语言模型与数据平滑（纯Python实现，无NLTK） ----------------------
-# 内置模拟语料
+# ---------------------- 模块1：n元语言模型与数据平滑（纯Python实现） ----------------------
 CORPUS = [
     ["the", "company", "reported", "a", "profit"],
     ["the", "stock", "market", "is", "rising"],
@@ -25,7 +24,6 @@ CORPUS = [
 ]
 
 def simple_tokenize(text):
-    # 纯Python分词，替代nltk.word_tokenize
     return text.lower().split()
 
 def train_ngram_model(n=3, use_smoothing=False):
@@ -34,7 +32,6 @@ def train_ngram_model(n=3, use_smoothing=False):
     prefix_counts = defaultdict(Counter)
     
     for sent in CORPUS:
-        # 补全前后缀标记
         sent = ['<s>']*(n-1) + sent + ['</s>']
         for i in range(len(sent)-n+1):
             prefix = tuple(sent[i:i+n-1])
@@ -46,12 +43,10 @@ def train_ngram_model(n=3, use_smoothing=False):
         total = prefix_counts.get(prefix, {}).get("total", 0)
         count = ngram_counts.get(prefix, {}).get(word, 0)
         if use_smoothing:
-            # Laplace平滑
             vocab_size = len(set(word for sent in CORPUS for word in sent)) + 2
             return (count + 1) / (total + vocab_size)
         else:
             return count / total if total > 0 else 0.0
-    
     return get_prob
 
 def get_ngram_prob(model, sentence, n=3):
@@ -64,7 +59,7 @@ def get_ngram_prob(model, sentence, n=3):
         prob *= model(prefix, word)
     return prob
 
-# ---------------------- 模块2：从零训练RNN语言模型 ----------------------
+# ---------------------- 模块2：从零训练RNN语言模型（修复维度错误） ----------------------
 class CharRNN(nn.Module):
     def __init__(self, vocab_size, hidden_size, num_layers=1):
         super().__init__()
@@ -79,9 +74,6 @@ class CharRNN(nn.Module):
         out, hidden = self.rnn(x, hidden)
         out = self.fc(out.reshape(out.size(0)*out.size(1), out.size(2)))
         return out, hidden
-    
-    def init_hidden(self, batch_size):
-        return torch.zeros(self.num_layers, batch_size, self.hidden_size)
 
 def train_char_rnn(text, hidden_size, epochs, lr):
     chars = sorted(list(set(text)))
@@ -105,7 +97,7 @@ def train_char_rnn(text, hidden_size, epochs, lr):
     
     model.train()
     for epoch in range(epochs):
-        hidden = model.init_hidden(1)
+        hidden = torch.zeros(model.num_layers, x.size(0), model.hidden_size)
         optimizer.zero_grad()
         output, hidden = model(x, hidden)
         loss = criterion(output, y.view(-1))
@@ -117,7 +109,7 @@ def train_char_rnn(text, hidden_size, epochs, lr):
 
 def generate_text(model, char_to_idx, idx_to_char, start_char, length=50):
     model.eval()
-    hidden = model.init_hidden(1)
+    hidden = torch.zeros(model.num_layers, 1, model.hidden_size)
     input_char = torch.tensor([[char_to_idx[start_char]]])
     generated = start_char
     with torch.no_grad():
