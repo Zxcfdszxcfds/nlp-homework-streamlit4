@@ -59,7 +59,7 @@ def get_ngram_prob(model, sentence, n=3):
         prob *= model(prefix, word)
     return prob
 
-# ---------------------- 模块2：从零训练RNN语言模型（修复维度错误） ----------------------
+# ---------------------- 模块2：从零训练RNN语言模型（彻底修复版） ----------------------
 class CharRNN(nn.Module):
     def __init__(self, vocab_size, hidden_size, num_layers=1):
         super().__init__()
@@ -97,6 +97,7 @@ def train_char_rnn(text, hidden_size, epochs, lr):
     
     model.train()
     for epoch in range(epochs):
+        # 训练时hidden的维度必须和batch size对齐
         hidden = torch.zeros(model.num_layers, x.size(0), model.hidden_size)
         optimizer.zero_grad()
         output, hidden = model(x, hidden)
@@ -109,6 +110,7 @@ def train_char_rnn(text, hidden_size, epochs, lr):
 
 def generate_text(model, char_to_idx, idx_to_char, start_char, length=50):
     model.eval()
+    # 生成时batch size是1，hidden维度必须是 (num_layers, 1, hidden_size)
     hidden = torch.zeros(model.num_layers, 1, model.hidden_size)
     input_char = torch.tensor([[char_to_idx[start_char]]])
     generated = start_char
