@@ -1,178 +1,267 @@
-
 import streamlit as st
+import nltk
+from nltk import ngrams
+from nltk.corpus import reuters
+from nltk.lm import Laplace, MLE
+from nltk.lm.preprocessing import padded_everygram_pipeline
+import torch
+import torch.nn as nn
+import pandas as pd
 from transformers import pipeline
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 
 # ---------------------- 页面配置 ----------------------
 st.set_page_config(
-    page_title="机器翻译对比与评测系统",
-    page_icon="🌐",
+    page_title="语言模型训练与对比分析平台",
+    page_icon="📚",
     layout="wide"
 )
 
+# ---------------------- 预下载 NLTK 数据 ----------------------
+@st.cache_resource
+def download_nltk_data():
+    nltk.download('reuters')
+    nltk.download('punkt')
 
-# ---------------------- 缓存模型加载 ----------------------
-@st.cache_resource(show_spinner="正在加载翻译模型...")
-def load_translator():
-    """加载 Hugging Face 的英译中模型"""
-    translator = pipeline(
-        "translation_en_to_zh",
-        model="Helsinki-NLP/opus-mt-en-zh",
-        device=-1  # 使用 CPU，避免无 GPU 报错
-    )
-    return translator
+download_nltk_data()
 
+# ---------------------- 模块1：n元语言模型与数据平滑 ----------------------
+def train_ngram_model(n=3, use_smoothing=False):
+    # 加载Reuters语料
+    sentences = reuters.sents()[:1000]  # 取前1000句轻量训练
+    train_data, padded_vocab = padded_everygram_pipeline(n, sentences)
+    
+    if use_smoothing:
+        model = Laplace(n)
+    else:
+        model = MLE(n)
+    model.fit(train_data, padded_vocab)
+    return model
 
-translator = load_translator()
+def get_ngram_prob(model, sentence, n=3):
+    tokens = nltk.word_tokenize(sentence.lower())
+    # 生成n-gram
+    if len(tokens) < n:
+        tokens = ['<s>']*(n-1) + tokens + ['</s>']
+    else:
+        tokens = ['<s>']*(n-1) + tokens + ['</s>']
+    ngrams_list = list(ngrams(tokens, n))
+    # 计算联合概率
+    prob = 1.0
+    for gram in ngrams_list:
+        prob *= model.score(gram[-1], gram[:-1])
+    return prob
 
-# ---------------------- 基于规则的翻译词典 ----------------------
-# 基础英中词典，模拟早期机器翻译
-basic_dict = {
-    "I": "我",
-    "you": "你",
-    "he": "他",
-    "she": "她",
-    "it": "它",
-    "we": "我们",
-    "they": "他们",
-    "am": "是",
-    "is": "是",
-    "are": "是",
-    "was": "是",
-    "were": "是",
-    "have": "有",
-    "has": "有",
-    "do": "做",
-    "does": "做",
-    "did": "做",
-    "go": "去",
-    "went": "去",
-    "eat": "吃",
-    "ate": "吃",
-    "drink": "喝",
-    "drank": "喝",
-    "run": "跑",
-    "ran": "跑",
-    "walk": "走",
-    "walked": "走",
-    "like": "喜欢",
-    "likes": "喜欢",
-    "love": "爱",
-    "loves": "爱",
-    "cat": "猫",
-    "dog": "狗",
-    "rain": "下雨",
-    "cats": "猫",
-    "dogs": "狗",
-    "raining": "下雨",
-    "raining cats and dogs": "下猫下狗"  # 俚语的逐词保留
-}
+# ---------------------- 模块2：从零训练RNN语言模型 ----------------------
+class CharRNN(nn.Module):
+    def __init__(self, vocab_size, hidden_size, num_layers=1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.rnn = nn.RNN(hidden_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, vocab_size)
+    
+    def forward(self, x, hidden):
+        x = self.embedding(x)
+        out, hidden = self.rnn(x, hidden)
+        out = self.fc(out.reshape(out.size(0)*out.size(1), out.size(2)))
+        return out, hidden
+    
+    def init_hidden(self, batch_size):
+        return torch.zeros(self.num_layers, batch_size, self.hidden_size)
 
+def train_char_rnn(text, hidden_size, epochs, lr):
+    # 字符映射
+    chars = sorted(list(set(text)))
+    char_to_idx = {c:i for i,c in enumerate(chars)}
+    idx_to_char = {i:c for i,c in enumerate(chars)}
+    vocab_size = len(chars)
+    
+    # 数据准备
+    seq_length = 10
+    data = [char_to_idx[c] for c in text]
+    x = []
+    y = []
+    for i in range(0, len(data)-seq_length):
+        x.append(data[i:i+seq_length])
+        y.append(data[i+1:i+seq_length+1])
+    x = torch.tensor(x)
+    y = torch.tensor(y)
+    
+    # 模型初始化
+    model = CharRNN(vocab_size, hidden_size)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    losses = []
+    
+    # 训练循环
+    model.train()
+    for epoch in range(epochs):
+        hidden = model.init_hidden(1)
+        optimizer.zero_grad()
+        output, hidden = model(x, hidden)
+        loss = criterion(output, y.view(-1))
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+    
+    return model, char_to_idx, idx_to_char, losses
 
-def rule_based_translate(sentence: str) -> str:
-    """基于词典的逐词直译"""
-    words = sentence.strip().split()
-    translated = []
-    for word in words:
-        # 处理标点
-        clean_word = word.strip(".,!?").lower()
-        if clean_word in basic_dict:
-            translated.append(basic_dict[clean_word])
-        else:
-            # 不在词典里的词直接保留
-            translated.append(word)
-    return " ".join(translated)
+def generate_text(model, char_to_idx, idx_to_char, start_char, length=50):
+    model.eval()
+    hidden = model.init_hidden(1)
+    input_char = torch.tensor([[char_to_idx[start_char]]])
+    generated = start_char
+    with torch.no_grad():
+        for _ in range(length):
+            output, hidden = model(input_char, hidden)
+            prob = nn.functional.softmax(output[-1], dim=0).data
+            idx = torch.multinomial(prob, 1).item()
+            generated += idx_to_char[idx]
+            input_char = torch.tensor([[idx]])
+    return generated
 
+# ---------------------- 模块3：预训练架构对比（Masked LM vs Causal LM） ----------------------
+@st.cache_resource
+def load_masked_lm():
+    return pipeline("fill-mask", model="bert-base-uncased")
+
+@st.cache_resource
+def load_causal_lm():
+    return pipeline("text-generation", model="distilgpt2")
+
+# ---------------------- 模块4：语言模型评价（困惑度PPL） ----------------------
+def calculate_ppl(model, tokenizer, sentence):
+    inputs = tokenizer(sentence, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs, labels=inputs["input_ids"])
+        loss = outputs.loss
+        ppl = torch.exp(loss).item()
+    return ppl
 
 # ---------------------- 页面内容 ----------------------
-st.title("🌐 机器翻译对比与评测系统")
+st.title("📚 语言模型训练与对比分析平台")
 st.markdown("---")
 
-# 分三个模块的 Tab
-tab1, tab2, tab3 = st.tabs([
-    "模块1：神经机器翻译引擎",
-    "模块2：直译 vs. 意译对比",
-    "模块3：BLEU 自动评测"
+tab1, tab2, tab3, tab4 = st.tabs([
+    "模块1：n元语言模型与平滑",
+    "模块2：RNN语言模型训练",
+    "模块3：预训练架构对比",
+    "模块4：困惑度PPL计算"
 ])
 
-# ---------------------- 模块1：神经机器翻译引擎 ----------------------
+# ---------------------- 模块1：n元语言模型与平滑 ----------------------
 with tab1:
-    st.header("🧠 神经机器翻译引擎 (NMT Engine)")
-    st.markdown("输入英文句子，体验基于 Transformer 的英译中效果。")
-
-    # 输入框
-    en_text = st.text_area(
-        "请输入英文句子：",
-        value="It rains cats and dogs.",
-        height=150
+    st.header("🔤 n元语言模型与数据平滑")
+    st.markdown("基于Reuters语料训练Trigram模型，对比平滑前后的概率计算结果")
+    
+    n_gram = st.selectbox("选择n元语法", [2, 3], index=1)
+    use_smoothing = st.checkbox("开启Laplace平滑", value=False)
+    input_sentence = st.text_area(
+        "输入句子计算生成概率",
+        value="The company reported a profit.",
+        height=100
     )
+    
+    if st.button("计算概率", key="ngram_btn"):
+        with st.spinner("训练模型中..."):
+            model = train_ngram_model(n=n_gram, use_smoothing=use_smoothing)
+            prob = get_ngram_prob(model, input_sentence, n=n_gram)
+            st.success(f"句子生成概率：{prob:.8f}")
+            if prob == 0:
+                st.warning("未开启平滑时，未见过的Trigram会导致概率为0（数据稀疏问题）")
 
-    if st.button("开始翻译", key="btn1"):
-        with st.spinner("模型正在翻译中..."):
-            # 调用翻译模型
-            result = translator(en_text)[0]["translation_text"]
-            st.success("翻译完成！")
-            st.subheader("译文结果：")
-            st.info(result)
-
-# ---------------------- 模块2：直译 vs. 意译对比 ----------------------
+# ---------------------- 模块2：从零训练RNN语言模型 ----------------------
 with tab2:
-    st.header("⚖️ 基于规则的直译 vs. 神经网络意译")
-    st.markdown("对比两种翻译范式的差异，观察基于规则翻译的局限性。")
-
-    # 输入框
-    en_text2 = st.text_area(
-        "请输入英文句子：",
-        value="It rains cats and dogs.",
+    st.header("🔄 从零训练RNN语言模型")
+    st.markdown("使用字符级RNN训练自定义文本，观察序列模式学习效果")
+    
+    train_text = st.text_area(
+        "输入训练文本（建议短文本）",
+        value="hello world hello python hello streamlit",
         height=150
     )
-
-    if st.button("开始对比", key="btn2"):
-        with st.spinner("正在对比两种翻译结果..."):
-            # 1. 基于规则的直译
-            rule_trans = rule_based_translate(en_text2)
-            # 2. 神经机器翻译
-            nmt_trans = translator(en_text2)[0]["translation_text"]
-
-            # 并排展示
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("基于规则的直译")
-                st.warning(rule_trans)
-            with col2:
-                st.subheader("神经网络意译")
-                st.success(nmt_trans)
-
-# ---------------------- 模块3：BLEU 自动评测 ----------------------
-with tab3:
-    st.header("📊 机器翻译质量自动评测 (BLEU Score)")
-    st.markdown("输入待评测译文和参考译文，自动计算 BLEU 分数（0~1，越高越接近参考译文）。")
-
-    # 输入框
-    candidate_text = st.text_area("待评测译文（如 NMT 或直译结果）：", height=100)
-    reference_text = st.text_area("参考译文（人工翻译或标准译文）：", height=100)
-
-    if st.button("计算 BLEU 分数", key="btn3"):
-        if not candidate_text or not reference_text:
-            st.error("请输入待评测译文和参考译文！")
-        else:
-            # 分词
-            candidate = candidate_text.split()
-            reference = [reference_text.split()]  # 参考译文需要是列表的列表
-
-            # 计算 BLEU，带平滑函数避免零分
-            smoothie = SmoothingFunction().method4
-            bleu_score = sentence_bleu(reference, candidate, smoothing_function=smoothie)
-
-            st.success(f"BLEU 分数：{bleu_score:.4f}")
-            # 解释分数
-            if bleu_score >= 0.7:
-                st.info("✅ 译文质量优秀，与参考译文高度匹配")
-            elif bleu_score >= 0.4:
-                st.info("⚠️ 译文质量中等，部分内容与参考译文有差异")
+    hidden_size = st.slider("隐藏层维度", 16, 128, 32)
+    epochs = st.slider("训练轮数", 10, 200, 50)
+    lr = st.slider("学习率", 0.001, 0.01, 0.005, step=0.001)
+    
+    if st.button("开始训练", key="rnn_btn"):
+        with st.spinner("训练中..."):
+            model, char_to_idx, idx_to_char, losses = train_char_rnn(train_text, hidden_size, epochs, lr)
+            st.line_chart(pd.DataFrame(losses, columns=["Loss"]))
+            st.session_state["rnn_model"] = (model, char_to_idx, idx_to_char)
+            st.success("训练完成！")
+    
+    if "rnn_model" in st.session_state:
+        start_char = st.text_input("输入起始字符", value="h")
+        if st.button("生成文本", key="gen_btn"):
+            model, char_to_idx, idx_to_char = st.session_state["rnn_model"]
+            if start_char in char_to_idx:
+                generated = generate_text(model, char_to_idx, idx_to_char, start_char)
+                st.code(generated)
             else:
-                st.warning("❌ 译文质量较差，与参考译文差异较大")
+                st.error("起始字符不在训练文本中，请重新输入")
+
+# ---------------------- 模块3：预训练架构对比 ----------------------
+with tab3:
+    st.header("⚖️ Masked LM vs. Causal LM")
+    st.markdown("对比BERT（双向）与DistilGPT2（单向）的生成机制差异")
+    
+    masked_lm = load_masked_lm()
+    causal_lm = load_causal_lm()
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("BERT（Masked LM）")
+        masked_text = st.text_input(
+            "输入带[MASK]的句子",
+            value="The man went to the [MASK] to buy some milk."
+        )
+        if st.button("预测Mask", key="bert_btn"):
+            with st.spinner("预测中..."):
+                result = masked_lm(masked_text, top_k=5)
+                st.dataframe(pd.DataFrame([{"token": r["token_str"], "score": r["score"]} for r in result]))
+    
+    with col2:
+        st.subheader("DistilGPT2（Causal LM）")
+        prompt_text = st.text_input(
+            "输入提示词",
+            value="The man went to the store to buy"
+        )
+        if st.button("续写文本", key="gpt_btn"):
+            with st.spinner("生成中..."):
+                result = causal_lm(prompt_text, max_new_tokens=20, do_sample=True)
+                st.code(result[0]["generated_text"])
+
+# ---------------------- 模块4：困惑度PPL计算 ----------------------
+with tab4:
+    st.header("📊 语言模型困惑度（PPL）计算")
+    st.markdown("基于DistilGPT2计算句子困惑度，数值越小表示模型越匹配该句子")
+    
+    @st.cache_resource
+    def load_ppl_model():
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model = AutoModelForCausalLM.from_pretrained("distilgpt2")
+        tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
+        tokenizer.pad_token = tokenizer.eos_token
+        return model, tokenizer
+    
+    ppl_model, ppl_tokenizer = load_ppl_model()
+    
+    test_sentences = st.text_area(
+        "输入测试句子（每行一句）",
+        value="The quick brown fox jumps over the lazy dog.\nasd qwe zxc 123",
+        height=150
+    )
+    
+    if st.button("计算PPL", key="ppl_btn"):
+        sentences = [s.strip() for s in test_sentences.split("\n") if s.strip()]
+        results = []
+        for sent in sentences:
+            ppl = calculate_ppl(ppl_model, ppl_tokenizer, sent)
+            results.append({"句子": sent, "困惑度(PPL)": round(ppl, 2)})
+        st.dataframe(pd.DataFrame(results))
 
 # ---------------------- 页脚 ----------------------
 st.markdown("---")
-st.markdown("© 2025 NLP 课程 Week 9 实验 | 机器翻译对比与评测系统")
+st.markdown("© 2025 NLP 课程 Week X 实验 | 语言模型训练与对比分析平台")
