@@ -59,7 +59,7 @@ def get_ngram_prob(model, sentence, n=3):
         prob *= model(prefix, word)
     return prob
 
-# ---------------------- 模块2：从零训练RNN语言模型（修正缩进版） ----------------------
+# ---------------------- 模块2：从零训练RNN语言模型（无注释干扰版） ----------------------
 class CharRNN(nn.Module):
     def __init__(self, vocab_size, hidden_size, num_layers=1):
         super().__init__()
@@ -76,7 +76,6 @@ class CharRNN(nn.Module):
         return out, hidden
 
 def train_char_rnn(text, hidden_size, epochs, lr):
-    # 【修正】chars定义已移到函数最外层，不会再被错误执行
     chars = sorted(list(set(text)))
     char_to_idx = {c:i for i,c in enumerate(chars)}
     idx_to_char = {i:c for i,c in enumerate(chars)}
