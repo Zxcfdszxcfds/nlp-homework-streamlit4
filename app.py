@@ -1,8 +1,4 @@
 import streamlit as st
-import nltk
-from nltk import ngrams
-from nltk.lm import Laplace, MLE
-from nltk.lm.preprocessing import padded_everygram_pipeline
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -15,15 +11,8 @@ st.set_page_config(
     layout="wide"
 )
 
-# ---------------------- 预下载 NLTK 数据 ----------------------
-@st.cache_resource
-def download_nltk_data():
-    nltk.download('punkt')
-
-download_nltk_data()
-
-# ---------------------- 模块1：n元语言模型与数据平滑（修复版：不用reuters语料） ----------------------
-# 内置模拟语料，避免reuters报错
+# ---------------------- 模块1：n元语言模型与数据平滑（纯Python实现，无NLTK） ----------------------
+# 内置模拟语料
 CORPUS = [
     ["the", "company", "reported", "a", "profit"],
     ["the", "stock", "market", "is", "rising"],
@@ -35,25 +24,44 @@ CORPUS = [
     ["the", "quarterly", "results", "were", "strong"]
 ]
 
+def simple_tokenize(text):
+    # 纯Python分词，替代nltk.word_tokenize
+    return text.lower().split()
+
 def train_ngram_model(n=3, use_smoothing=False):
-    train_data, padded_vocab = padded_everygram_pipeline(n, CORPUS)
-    if use_smoothing:
-        model = Laplace(n)
-    else:
-        model = MLE(n)
-    model.fit(train_data, padded_vocab)
-    return model
+    from collections import defaultdict, Counter
+    ngram_counts = defaultdict(Counter)
+    prefix_counts = defaultdict(Counter)
+    
+    for sent in CORPUS:
+        # 补全前后缀标记
+        sent = ['<s>']*(n-1) + sent + ['</s>']
+        for i in range(len(sent)-n+1):
+            prefix = tuple(sent[i:i+n-1])
+            word = sent[i+n-1]
+            ngram_counts[prefix][word] += 1
+            prefix_counts[prefix]["total"] += 1
+    
+    def get_prob(prefix, word):
+        total = prefix_counts.get(prefix, {}).get("total", 0)
+        count = ngram_counts.get(prefix, {}).get(word, 0)
+        if use_smoothing:
+            # Laplace平滑
+            vocab_size = len(set(word for sent in CORPUS for word in sent)) + 2
+            return (count + 1) / (total + vocab_size)
+        else:
+            return count / total if total > 0 else 0.0
+    
+    return get_prob
 
 def get_ngram_prob(model, sentence, n=3):
-    tokens = nltk.word_tokenize(sentence.lower())
-    if len(tokens) < n:
-        tokens = ['<s>']*(n-1) + tokens + ['</s>']
-    else:
-        tokens = ['<s>']*(n-1) + tokens + ['</s>']
-    ngrams_list = list(ngrams(tokens, n))
+    tokens = simple_tokenize(sentence)
+    tokens = ['<s>']*(n-1) + tokens + ['</s>']
     prob = 1.0
-    for gram in ngrams_list:
-        prob *= model.score(gram[-1], gram[:-1])
+    for i in range(len(tokens)-n+1):
+        prefix = tuple(tokens[i:i+n-1])
+        word = tokens[i+n-1]
+        prob *= model(prefix, word)
     return prob
 
 # ---------------------- 模块2：从零训练RNN语言模型 ----------------------
